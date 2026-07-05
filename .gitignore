@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+dist/
+build/
+
+# Secrets / local config (never commit)
+*.local
+*.pem
+*.key
+local.settings.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
