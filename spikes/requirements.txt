@@ -1,0 +1,6 @@
+# MAF Python de-risking spike
+agent-framework
+azure-identity
+# The Foundry client / MCP toolbox path may also pull azure-ai-projects; if an
+# import error mentions it, add:
+# azure-ai-projects
