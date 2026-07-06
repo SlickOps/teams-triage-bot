@@ -29,13 +29,14 @@ def build_adapter() -> CloudAdapter:
     return CloudAdapter(bot_framework_auth)
 
 
-async def echo(turn_context) -> None:
-    """The only bot logic in Phase 1: reply with what was said, from code, not from
-    any model output (moot today, but keeps the "actions from code" shape from the
-    start)."""
-    from botbuilder.core import TurnContext
+async def send_text(turn_context, text: str) -> None:
+    """Send a plain text reply. Trivial wrapper, but keeps app.py's interview
+    handler from needing to know the SDK call shape."""
+    await turn_context.send_activity(text)
 
-    # In channels the incoming text includes the "@Bot Name" mention markup;
-    # strip it so the echo only reflects what the user actually typed.
-    text = TurnContext.remove_recipient_mention(turn_context.activity) or ""
-    await turn_context.send_activity(f"you said: {text.strip()}")
+
+async def send_card(turn_context, card: dict) -> None:
+    """Send an Adaptive Card as an attachment."""
+    from botbuilder.core import CardFactory, MessageFactory
+
+    await turn_context.send_activity(MessageFactory.attachment(CardFactory.adaptive_card(card)))

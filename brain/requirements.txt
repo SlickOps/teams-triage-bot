@@ -4,3 +4,16 @@ botbuilder-core==4.17.1
 botbuilder-integration-aiohttp==4.17.1
 botbuilder-schema==4.17.1
 botframework-connector==4.17.1
+azure-data-tables==12.7.0
+# agent-framework (via its `mcp` dep) requires pydantic>=2.11; keep this a range,
+# not a hard pin, so pip can co-resolve it with agent-framework rather than
+# conflicting (a ==2.9.2 pin fails the ACR build with ResolutionImpossible).
+pydantic>=2.11,<3
+
+# MAF: pinned to the version verified live against Foundry gpt-5-mini (structured
+# output via ChatOptions.response_format, FoundryChatClient, the InterviewTurn
+# round-trip). The bare `agent-framework` meta-package includes agent_framework.foundry
+# (confirmed) -- no separate agent-framework-foundry / azure-ai-projects needed.
+# NOTE: leave pydantic as a range (>=2.11) above; a hard pin makes pip backtrack
+# agent-framework and fail resolution.
+agent-framework==1.10.0
