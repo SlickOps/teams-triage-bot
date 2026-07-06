@@ -1,0 +1,35 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.19/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.19",
+  "version": "1.0.0",
+  "id": "__BOT_APP_ID__",
+  "developer": {
+    "name": "Personal POC",
+    "websiteUrl": "https://example.com",
+    "privacyUrl": "https://example.com/privacy",
+    "termsOfUseUrl": "https://example.com/tos"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "name": {
+    "short": "Triage Bot (POC)",
+    "full": "Teams Triage Bot -- personal POC"
+  },
+  "description": {
+    "short": "Phase 1: echoes what you say. Later phases add triage.",
+    "full": "Personal POC triage bot. Phase 1 only proves the Teams-to-brain plumbing: @mention or DM the bot and it echoes your message back. No AI, no investigation, no posting yet -- see the project's docs/ for the phase roadmap."
+  },
+  "accentColor": "#0A5A9E",
+  "bots": [
+    {
+      "botId": "__BOT_APP_ID__",
+      "scopes": ["team", "personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": []
+}

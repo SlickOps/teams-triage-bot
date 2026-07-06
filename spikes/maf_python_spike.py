@@ -123,6 +123,11 @@ async def check_mcp_tool() -> bool:
                 name="spike_tools",
                 description="Tools served by the spike MCP endpoint",
                 url=mcp_url,
+                # MCP *prompts* (not tools) get converted to OpenAI function schemas too
+                # when load_prompts=True (the default), and at least one prompt with an
+                # optional string arg produces an invalid schema Azure OpenAI rejects.
+                # We also don't want the model treating prompts as agent-callable anyway.
+                load_prompts=False,
             ),
         ) as agent:
             result = await agent.run(
