@@ -6,10 +6,16 @@ from collections import OrderedDict
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.servicebus.aio import ServiceBusClient
+from botbuilder.core import TurnContext
 from botbuilder.schema import Activity
 from botframework.connector.auth import ClaimsIdentity
 
-from reply import build_adapter, echo
+from cards import build_intake_card, parse_card_submit
+from intake import IntakeField, StructuredSummary
+from interviewer import InterviewerError, run_turn
+from redact import redact
+from reply import build_adapter, send_card, send_text
+from state_store import InterviewState, build_state_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("brain")
@@ -19,6 +25,12 @@ _QUEUE_NAME = os.environ.get("SERVICE_BUS_QUEUE_NAME", "activities")
 _TENANT_ID = os.environ["BOT_TENANT_ID"]
 _APP_ID = os.environ["BOT_APP_ID"]
 
+_INTRO_LINE = (
+    "Got it -- let's nail down the specifics. I've dropped a quick form below; "
+    "fill in what you can (blanks are fine if something genuinely doesn't apply -- "
+    "just tell me why in chat)."
+)
+
 
 def _activity_tenant_id(activity: Activity) -> str:
     channel_data = activity.channel_data if isinstance(activity.channel_data, dict) else {}
@@ -26,6 +38,32 @@ def _activity_tenant_id(activity: Activity) -> str:
     if isinstance(tenant, dict) and tenant.get("id"):
         return tenant["id"]
     return getattr(activity.conversation, "tenant_id", None)
+
+
+def _activity_user_id(activity: Activity) -> str:
+    """Prefer the AAD object id (stable, tenant-scoped identity); fall back to
+    the channel-assigned `from.id` for channels/configurations where the AAD
+    object id isn't populated."""
+    from_property = activity.from_property
+    aad_object_id = getattr(from_property, "aad_object_id", None)
+    if aad_object_id:
+        return aad_object_id
+    return from_property.id
+
+
+def _render_summary_markdown(summary: StructuredSummary) -> str:
+    lines = [
+        f"**Environment:** {summary.environment}",
+        f"**Service:** {summary.service}",
+    ]
+    if summary.jenkins_job_url:
+        lines.append(f"**Jenkins:** {summary.jenkins_job_url}")
+    lines.append(f"**Symptom:** {summary.symptom}")
+    lines.append(f"**What we know:** {summary.what_we_know}")
+    if summary.open_questions:
+        lines.append(f"**Open questions:** {summary.open_questions}")
+    return "\n\n".join(lines)
+
 
 # Phase 1 stand-in for real dedup: an in-memory, bounded LRU, scoped to this
 # process's lifetime only. It does NOT survive a pod restart -- true idempotency
@@ -45,7 +83,61 @@ def _mark_seen(activity_id: str) -> None:
         _seen_activity_ids.popitem(last=False)
 
 
-async def handle_envelope(adapter, envelope: dict) -> None:
+async def _run_interview_turn(turn_context, state: InterviewState, store) -> None:
+    """The interview logic proper. Runs inside the adapter's callback (so it
+    has a turn_context to send with) but does its own state persistence, since
+    persistence doesn't depend on the turn_context.
+
+    A model failure (InterviewerError) is handled HERE -- persist what we have
+    and tell the user once -- rather than re-raised. Re-raising would abandon the
+    queue message, and a *deterministic* model error would then redeliver and
+    re-fail up to Service Bus's max-delivery count (10x), spamming the user with
+    identical snack messages before dead-lettering. Completing the message
+    instead means a rare transient blip drops a single turn -- the user just
+    sends again, and because the merged input was persisted the interview resumes
+    with nothing lost. Genuine crashes (not InterviewerError) still propagate out
+    of process_proactive -> abandon -> redelivery, preserving Phase 1's
+    crash-safety (docs/00-overview.md guardrail #8)."""
+    if not state.card_sent:
+        # First turn of a brand-new interview: the card collects the essentials
+        # directly, so we send it (plus a short grilling line) and skip the
+        # model entirely this turn -- simpler than also asking the model to
+        # react to the very first low-effort message.
+        await send_text(turn_context, redact(_INTRO_LINE))
+        await send_card(turn_context, build_intake_card())
+        state.card_sent = True
+        await store.put(state)
+        return
+
+    try:
+        turn = await run_turn(state)
+    except InterviewerError:
+        logger.exception("interview turn failed for user %s", state.user_id)
+        # Persist what we have (including any card answers just merged in
+        # handle_envelope) so the reporter's input survives the failure, then
+        # degrade gracefully with a single message. Do NOT re-raise -- see the
+        # docstring for why abandoning here would spam the user 10x.
+        await store.put(state)
+        await send_text(
+            turn_context,
+            redact("I hit a snag reaching my brain -- please send that again in a moment."),
+        )
+        return
+
+    state.intake = turn.intake
+    state.transcript.append({"role": "bot", "text": turn.reply_to_user})
+
+    if turn.enough_to_be_useful and turn.summary is not None:
+        state.status = "complete"
+        await send_text(turn_context, redact(turn.reply_to_user))
+        await send_text(turn_context, redact(_render_summary_markdown(turn.summary)))
+    else:
+        await send_text(turn_context, redact(turn.reply_to_user))
+
+    await store.put(state)
+
+
+async def handle_envelope(adapter, store, envelope: dict) -> None:
     activity = Activity.deserialize(envelope["activity"])
     claims = envelope["claims"]
 
@@ -70,8 +162,35 @@ async def handle_envelope(adapter, envelope: dict) -> None:
         logger.info("skipping already-processed activity %s", activity.id)
         return
 
+    user_id = _activity_user_id(activity)
+    is_card_submit = isinstance(activity.value, dict) and bool(activity.value)
+
+    state = await store.get(user_id)
+    if state is None or (state.status == "complete" and not is_card_submit):
+        state = InterviewState(user_id=user_id)
+
+    if is_card_submit:
+        # Receiving a submit means the card was already shown -- mark it sent so
+        # a turn on freshly-created state (e.g. after TTL expiry or an in-memory
+        # fallback restart lost the row) processes the answers instead of
+        # re-sending the card and throwing away what the user just submitted.
+        state.card_sent = True
+        answers = parse_card_submit(activity.value)
+        for field_name, text in answers.items():
+            setattr(state.intake, field_name, IntakeField(value=text))
+        rendered = ", ".join(f"{k}={v}" for k, v in answers.items()) or "(no fields filled in)"
+        state.transcript.append({"role": "user", "text": f"Card answers: {rendered}"})
+    else:
+        # In channels the incoming text includes the "@Bot Name" mention markup;
+        # strip it so we only see what the user actually typed.
+        text = TurnContext.remove_recipient_mention(activity) or activity.text or ""
+        state.transcript.append({"role": "user", "text": text.strip()})
+
+    async def _callback(turn_context) -> None:
+        await _run_interview_turn(turn_context, state, store)
+
     claims_identity = ClaimsIdentity(claims=claims, is_authenticated=True)
-    await adapter.process_proactive(claims_identity, activity, envelope["audience"], echo)
+    await adapter.process_proactive(claims_identity, activity, envelope["audience"], _callback)
     # Mark seen only after a successful reply: marking earlier would make a
     # redelivery of a crashed attempt complete without ever replying.
     _mark_seen(activity.id)
@@ -80,6 +199,7 @@ async def handle_envelope(adapter, envelope: dict) -> None:
 
 async def main() -> None:
     adapter = build_adapter()
+    store = build_state_store()
     credential = DefaultAzureCredential()
     async with ServiceBusClient(_NAMESPACE, credential) as client:
         async with client.get_queue_receiver(_QUEUE_NAME) as receiver:
@@ -87,7 +207,7 @@ async def main() -> None:
             async for msg in receiver:
                 try:
                     envelope = json.loads(str(msg))
-                    await handle_envelope(adapter, envelope)
+                    await handle_envelope(adapter, store, envelope)
                     await receiver.complete_message(msg)
                 except Exception:
                     logger.exception("failed to process message, abandoning for redelivery")

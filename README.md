@@ -36,3 +36,8 @@ Two-plane design: an internet-facing, privilege-free **edge relay** validates th
 webhook and enqueues to Service Bus; the privileged **brain** (Microsoft Agent Framework,
 Python) runs inside AKS next to Jenkins with **zero inbound** — it only makes outbound
 calls. See the overview for the full diagram and trust model.
+
+As of Phase 2, the brain also calls out to an Azure AI Foundry model deployment
+(`gpt-5-mini`, via managed identity) to run the intake interview, and persists
+in-progress interview state in an Azure Storage table — both wired up by
+`infra/provision.sh` (see `infra/README.md`).

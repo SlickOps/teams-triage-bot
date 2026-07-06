@@ -10,6 +10,12 @@ RG="rg-teams-triage-poc"
 LOCATION="eastus2"
 TENANT_ID="ef5ff41e-4a26-4f61-98b6-8bada7ac8e2f"
 
+# Phase 2: pre-existing AI Foundry account from the MAF spike (spikes/azure-setup-log.md)
+# -- NOT created by this script, only wired up with RBAC + env vars below.
+FOUNDRY_ACCOUNT="aif-triage-poc-567b31"
+FOUNDRY_ENDPOINT="https://${FOUNDRY_ACCOUNT}.services.ai.azure.com/"
+FOUNDRY_MODEL="gpt-5-mini"
+
 BOT_NAME="teams-triage-poc-bot"
 VNET_NAME="vnet-triage-poc"
 SUBNET_NAME="snet-containerapps"
@@ -49,6 +55,9 @@ fi
 SUFFIX="$(cat "$SUFFIX_FILE")"
 SB_NAMESPACE="sb-triage-poc-${SUFFIX}"
 ACR_NAME="acrtriagepoc${SUFFIX}"
+# Phase 2: storage account for interview state (Table Storage). "sttriagepoc" (11) +
+# 6-hex suffix = 17 chars -- within the 3-24 char, lowercase-alphanumeric-only limit.
+ST_ACCOUNT="sttriagepoc${SUFFIX}"
 
 echo "== teams-triage-bot Phase 1 provisioning (suffix ${SUFFIX}) =="
 
@@ -100,6 +109,61 @@ run_allow_exists "sender role assignment" az role assignment create --assignee-o
   --role "Azure Service Bus Data Sender" --scope "$SB_QUEUE_ID"
 run_allow_exists "receiver role assignment" az role assignment create --assignee-object-id "$BRAIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
   --role "Azure Service Bus Data Receiver" --scope "$SB_QUEUE_ID"
+
+# ---------------------------------------------------------------------------
+# 3b. Phase 2: RBAC on the pre-existing AI Foundry account (from the MAF spike,
+#     spikes/azure-setup-log.md) so the brain's managed identity can call the
+#     gpt-5-mini deployment via FoundryChatClient. This account is NOT created
+#     here -- it's expected to already exist; fail loudly if it doesn't.
+#
+#     Per the spike log: the unified `services.ai.azure.com` endpoint 401s
+#     unless the caller has BOTH "Cognitive Services OpenAI User" AND
+#     "Azure AI Developer" on the account -- either role alone is insufficient.
+#     Also per the spike: RBAC propagation takes a few minutes, so a 401 right
+#     after this script runs isn't necessarily a misconfiguration.
+# ---------------------------------------------------------------------------
+echo "-- foundry rbac --"
+if ! FOUNDRY_ID=$(az cognitiveservices account show -n "$FOUNDRY_ACCOUNT" -g "$RG" --query id -o tsv 2>/dev/null); then
+  echo "ERROR: AI Foundry account '${FOUNDRY_ACCOUNT}' not found in resource group '${RG}'." >&2
+  echo "       This script does not create it -- it's expected to already exist from the" >&2
+  echo "       MAF spike. See spikes/azure-setup-log.md for how it was provisioned." >&2
+  exit 1
+fi
+
+run_allow_exists "brain Cognitive Services OpenAI User assignment" az role assignment create \
+  --assignee-object-id "$BRAIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+  --role "Cognitive Services OpenAI User" --scope "$FOUNDRY_ID"
+run_allow_exists "brain Azure AI Developer assignment" az role assignment create \
+  --assignee-object-id "$BRAIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+  --role "Azure AI Developer" --scope "$FOUNDRY_ID"
+
+# ---------------------------------------------------------------------------
+# 3c. Phase 2: storage account + Table for interview state (resumable,
+#     one-active-interview-per-user). RBAC-only access, no account keys.
+# ---------------------------------------------------------------------------
+echo "-- storage account (interview state) --"
+if az storage account show -g "$RG" -n "$ST_ACCOUNT" >/dev/null 2>&1; then
+  echo "  (storage account ${ST_ACCOUNT} already exists, continuing)"
+else
+  az storage account create -g "$RG" -n "$ST_ACCOUNT" -l "$LOCATION" \
+    --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 \
+    --allow-blob-public-access false >/dev/null
+fi
+ST_ID=$(az storage account show -g "$RG" -n "$ST_ACCOUNT" --query id -o tsv)
+
+run_allow_exists "brain Storage Table Data Contributor assignment" az role assignment create \
+  --assignee-object-id "$BRAIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+  --role "Storage Table Data Contributor" --scope "$ST_ID"
+
+# The `interviews` table itself is created lazily by the brain at runtime
+# (create-if-not-exists on first use) rather than here, because AAD-based
+# table creation needs the RBAC grant above to have propagated to the
+# *caller* (this script's signed-in identity, not the brain's), which isn't
+# guaranteed at this point in a fresh run. Best-effort attempt so a rerun
+# after propagation still ends up with the table present; failure here is
+# non-fatal.
+az storage table create --name interviews --account-name "$ST_ACCOUNT" \
+  --auth-mode login >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # 4. ACR + cloud builds (no local Docker on this machine -- az acr build
@@ -193,6 +257,32 @@ az containerapp create \
     "SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=${SB_FQNS}" \
     "SERVICE_BUS_QUEUE_NAME=${SB_QUEUE}" \
     "AZURE_CLIENT_ID=${BRAIN_CLIENT_ID}" \
+    "FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_ENDPOINT}" \
+    "FOUNDRY_MODEL=${FOUNDRY_MODEL}" \
+    "STATE_STORAGE_ACCOUNT=${ST_ACCOUNT}" \
+    "INTERVIEW_TABLE_NAME=interviews" \
+  >/dev/null
+
+# ---------------------------------------------------------------------------
+# 5b. Phase 2: brain env vars, applied via `update --set-env-vars` rather than
+#     relying solely on the `create` call above. `create` above is unguarded
+#     (errors on rerun if the app already exists, a pre-existing Phase 1
+#     behavior this script doesn't change) -- `--set-env-vars` is an upsert,
+#     so this line alone makes the Phase 2 wiring idempotent regardless of
+#     whether the brain app was just created or already existed.
+#
+#     New outbound egress this introduces for the brain (beyond Service Bus):
+#     *.services.ai.azure.com (Foundry) and *.table.core.windows.net
+#     (Storage). No egress allowlist is implemented yet (deferred, per the
+#     Phase 1 VNet/NSG comments above) -- noting the new destinations here for
+#     when that seam is picked up.
+# ---------------------------------------------------------------------------
+az containerapp update -g "$RG" -n "$BRAIN_APP" \
+  --set-env-vars \
+    "FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_ENDPOINT}" \
+    "FOUNDRY_MODEL=${FOUNDRY_MODEL}" \
+    "STATE_STORAGE_ACCOUNT=${ST_ACCOUNT}" \
+    "INTERVIEW_TABLE_NAME=interviews" \
   >/dev/null
 
 RELAY_FQDN=$(az containerapp show -g "$RG" -n "$RELAY_APP" --query properties.configuration.ingress.fqdn -o tsv)
@@ -248,3 +338,5 @@ echo "Bot messaging endpoint: https://${RELAY_FQDN}/api/messages"
 echo "BOT_APP_ID:             ${BRAIN_CLIENT_ID}"
 echo "BOT_TENANT_ID:          ${TENANT_ID}"
 echo "Service Bus namespace:  ${SB_FQNS}"
+echo "Storage account:        ${ST_ACCOUNT} (table: interviews)"
+echo "Foundry endpoint:       ${FOUNDRY_ENDPOINT} (model: ${FOUNDRY_MODEL})"
