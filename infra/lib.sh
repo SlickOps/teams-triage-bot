@@ -38,11 +38,9 @@ MCP_DATADOG_PORT=8802
 MCP_ARGOCD_PORT=8803
 
 # ---- suffix + derived globally-unique names -------------------------------
-# A random suffix is persisted next to this file so reruns target the SAME
-# globally-unique resources (ACR, Service Bus namespace, storage account)
-# rather than minting new ones. provision.sh creates it on first run; if you
-# run redeploy.sh before provisioning, it will mint a suffix that points at
-# resources that don't exist yet -- provision first.
+# Suffix pinning our globally-unique resource names (ACR, Service Bus, storage),
+# read from the committed infra/.suffix (see infra/README.md for why it's
+# committed). Generated here only as a fallback for a brand-new deployment.
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUFFIX_FILE="${LIB_DIR}/.suffix"
 if [[ ! -f "$SUFFIX_FILE" ]]; then

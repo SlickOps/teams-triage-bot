@@ -22,7 +22,6 @@ build/
 *.pem
 *.key
 local.settings.json
-infra/.suffix
 .venv-relay/
 
 # OS / editor

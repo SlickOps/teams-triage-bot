@@ -32,10 +32,13 @@ humans). This matters: `az containerapp update --image <repo>:latest` will **not
 new revision if the reference is byte-identical to what's deployed (ACA's ":latest doesn't
 redeploy" trap). Rolling to a fresh, specific tag guarantees the new code actually ships.
 
-A resource-name suffix is generated once and cached in `infra/.suffix` (gitignored) so
-reruns/redeploys target the same Service Bus namespace / ACR / storage account rather than
-creating new ones. Run `provision.sh` before `redeploy.sh` on a fresh checkout (redeploy
-needs the registry + apps to already exist).
+A resource-name suffix is cached in `infra/.suffix` so every run targets the same Service
+Bus namespace / ACR / storage account rather than creating new ones. **This file is
+committed to the repo** (not gitignored) on purpose: a fresh clone must reuse the same
+suffix, or it would provision a duplicate stack and orphan the real one. It's not a secret
+(resource names, like the already-committed Foundry account and tenant id, aren't sensitive
+on their own). Run `provision.sh` before `redeploy.sh` on a fresh checkout (redeploy needs
+the registry + apps to already exist).
 
 ## What it creates
 
