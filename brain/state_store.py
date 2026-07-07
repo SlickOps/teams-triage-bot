@@ -53,10 +53,18 @@ def _empty_intake() -> Intake:
 
 class InterviewState(BaseModel):
     user_id: str
-    status: str = "interviewing"  # "interviewing" | "complete"
+    status: str = "interviewing"  # "interviewing" | "complete" | "investigated"
     transcript: list[dict] = Field(default_factory=list)  # [{"role": "user"|"bot", "text": str}, ...]
     intake: Intake = Field(default_factory=_empty_intake)
     card_sent: bool = False
+    # Phase 3: the investigation report, once run_investigation() succeeds,
+    # stored as a JSON string (not the InvestigationReport model itself) for
+    # the same reason the rest of this file uses a flat "data" blob -- Table
+    # Storage entities are flat, and brain/investigation.py is the only place
+    # that needs the typed model back (state_store.py stays agnostic of its
+    # shape, matching how it already treats Intake/StructuredSummary loosely
+    # via the parent InterviewState blob rather than per-field columns).
+    investigation_report: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
     expires_at: float = 0.0

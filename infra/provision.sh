@@ -6,60 +6,20 @@
 # (the resource group already exists from the MAF spike).
 set -euo pipefail
 
-RG="rg-teams-triage-poc"
-LOCATION="eastus2"
-TENANT_ID="ef5ff41e-4a26-4f61-98b6-8bada7ac8e2f"
-
-# Phase 2: pre-existing AI Foundry account from the MAF spike (spikes/azure-setup-log.md)
-# -- NOT created by this script, only wired up with RBAC + env vars below.
-FOUNDRY_ACCOUNT="aif-triage-poc-567b31"
-FOUNDRY_ENDPOINT="https://${FOUNDRY_ACCOUNT}.services.ai.azure.com/"
-FOUNDRY_MODEL="gpt-5-mini"
-
-BOT_NAME="teams-triage-poc-bot"
-VNET_NAME="vnet-triage-poc"
-SUBNET_NAME="snet-containerapps"
-NSG_NAME="nsg-triage-relay-ingress"
-BRAIN_IDENTITY="id-triage-brain"
-RELAY_IDENTITY="id-triage-relay"
-SB_QUEUE="activities"
-CAE_NAME="cae-triage-poc"
-RELAY_APP="ca-triage-relay"
-BRAIN_APP="ca-triage-brain"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Run a command that's expected to fail with a specific "already exists"
-# error on reruns. Any other failure (missing RBAC permission, transient ARM
-# error, etc.) is a real failure and must not be masked as "already exists".
-run_allow_exists() {
-  local desc="$1"; shift
-  local out
-  if ! out=$("$@" 2>&1); then
-    if grep -qiE 'already exists|alreadyexists|conflict' <<<"$out"; then
-      echo "  (${desc} already exists, continuing)"
-    else
-      echo "ERROR: ${desc} failed:" >&2
-      echo "$out" >&2
-      exit 1
-    fi
-  fi
-}
+# All resource names, the persisted suffix, and the helpers (run_allow_exists,
+# ensure_app_created, build_image, roll_image, $BUILD_TAG) live in lib.sh so
+# provision.sh and redeploy.sh share exactly one source of truth.
+source "${SCRIPT_DIR}/lib.sh"
 
-# Persist a random suffix locally so reruns target the same globally-unique
-# resource names (ACR, Service Bus namespace) instead of creating new ones.
-SUFFIX_FILE="${SCRIPT_DIR}/.suffix"
-if [[ ! -f "$SUFFIX_FILE" ]]; then
-  openssl rand -hex 3 > "$SUFFIX_FILE"
-fi
-SUFFIX="$(cat "$SUFFIX_FILE")"
-SB_NAMESPACE="sb-triage-poc-${SUFFIX}"
-ACR_NAME="acrtriagepoc${SUFFIX}"
-# Phase 2: storage account for interview state (Table Storage). "sttriagepoc" (11) +
-# 6-hex suffix = 17 chars -- within the 3-24 char, lowercase-alphanumeric-only limit.
-ST_ACCOUNT="sttriagepoc${SUFFIX}"
+# This whole script is IDEMPOTENT -- safe to run repeatedly. Existing resources
+# are detected and left in place (or rolled to the freshly-built image); only
+# missing ones are created. So a rerun both (a) fills any gap from a partial
+# earlier run and (b) redeploys current code. For a fast redeploy of just an
+# app's image after a code change, prefer redeploy.sh.
 
-echo "== teams-triage-bot Phase 1 provisioning (suffix ${SUFFIX}) =="
+echo "== teams-triage-bot provisioning (suffix ${SUFFIX}, build ${BUILD_TAG}) =="
 
 # ---------------------------------------------------------------------------
 # 1. Managed identities -- no client secrets anywhere. The brain's identity
@@ -179,8 +139,11 @@ run_allow_exists "relay AcrPull assignment" az role assignment create --assignee
 run_allow_exists "brain AcrPull assignment" az role assignment create --assignee-object-id "$BRAIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
   --role AcrPull --scope "$ACR_ID"
 
-az acr build -r "$ACR_NAME" -t "relay:latest" "${SCRIPT_DIR}/../relay" >/dev/null
-az acr build -r "$ACR_NAME" -t "brain:latest" "${SCRIPT_DIR}/../brain" >/dev/null
+# Build with a unique tag (+ :latest) and capture the tagged ref, so the
+# create/update calls below roll a fresh revision rather than silently reusing
+# a cached :latest digest (see lib.sh BUILD_TAG).
+RELAY_IMAGE="$(build_image relay "${SCRIPT_DIR}/../relay")"
+BRAIN_IMAGE="$(build_image brain "${SCRIPT_DIR}/../brain")"
 
 # ---------------------------------------------------------------------------
 # 5. VNet (+ NSG), then a VNet-integrated Container Apps environment.
@@ -223,15 +186,22 @@ az network vnet subnet create -g "$RG" --vnet-name "$VNET_NAME" -n "$SUBNET_NAME
 SUBNET_ID=$(az network vnet subnet show -g "$RG" --vnet-name "$VNET_NAME" -n "$SUBNET_NAME" --query id -o tsv)
 
 echo "-- container apps environment --"
-az containerapp env create -g "$RG" -n "$CAE_NAME" -l "$LOCATION" \
-  --infrastructure-subnet-resource-id "$SUBNET_ID" >/dev/null
+if az containerapp env show -g "$RG" -n "$CAE_NAME" >/dev/null 2>&1; then
+  echo "  (container apps env ${CAE_NAME} already exists, continuing)"
+else
+  az containerapp env create -g "$RG" -n "$CAE_NAME" -l "$LOCATION" \
+    --infrastructure-subnet-resource-id "$SUBNET_ID" >/dev/null
+fi
 
 SB_FQNS="${SB_NAMESPACE}.servicebus.windows.net"
 
 echo "-- relay app --"
-az containerapp create \
-  -g "$RG" -n "$RELAY_APP" --environment "$CAE_NAME" \
-  --image "${ACR_LOGIN_SERVER}/relay:latest" \
+# ensure_app_created only creates if missing (rerun-safe); the update right
+# after always rolls the freshly-built image + upserts env, so a rerun redeploys
+# current code whether the app was just created or already existed.
+ensure_app_created "$RELAY_APP" \
+  --environment "$CAE_NAME" \
+  --image "$RELAY_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$RELAY_RESOURCE_ID" \
   --user-assigned "$RELAY_RESOURCE_ID" \
   --ingress external --target-port 3978 \
@@ -241,13 +211,21 @@ az containerapp create \
     "BOT_TENANT_ID=${TENANT_ID}" \
     "SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=${SB_FQNS}" \
     "SERVICE_BUS_QUEUE_NAME=${SB_QUEUE}" \
+    "AZURE_CLIENT_ID=${RELAY_CLIENT_ID}"
+az containerapp update -g "$RG" -n "$RELAY_APP" \
+  --image "$RELAY_IMAGE" \
+  --set-env-vars \
+    "BOT_APP_ID=${BRAIN_CLIENT_ID}" \
+    "BOT_TENANT_ID=${TENANT_ID}" \
+    "SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=${SB_FQNS}" \
+    "SERVICE_BUS_QUEUE_NAME=${SB_QUEUE}" \
     "AZURE_CLIENT_ID=${RELAY_CLIENT_ID}" \
   >/dev/null
 
 echo "-- brain app --"
-az containerapp create \
-  -g "$RG" -n "$BRAIN_APP" --environment "$CAE_NAME" \
-  --image "${ACR_LOGIN_SERVER}/brain:latest" \
+ensure_app_created "$BRAIN_APP" \
+  --environment "$CAE_NAME" \
+  --image "$BRAIN_IMAGE" \
   --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$BRAIN_RESOURCE_ID" \
   --user-assigned "$BRAIN_RESOURCE_ID" \
   --min-replicas 1 --max-replicas 1 \
@@ -260,16 +238,14 @@ az containerapp create \
     "FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_ENDPOINT}" \
     "FOUNDRY_MODEL=${FOUNDRY_MODEL}" \
     "STATE_STORAGE_ACCOUNT=${ST_ACCOUNT}" \
-    "INTERVIEW_TABLE_NAME=interviews" \
-  >/dev/null
+    "INTERVIEW_TABLE_NAME=interviews"
 
 # ---------------------------------------------------------------------------
-# 5b. Phase 2: brain env vars, applied via `update --set-env-vars` rather than
-#     relying solely on the `create` call above. `create` above is unguarded
-#     (errors on rerun if the app already exists, a pre-existing Phase 1
-#     behavior this script doesn't change) -- `--set-env-vars` is an upsert,
-#     so this line alone makes the Phase 2 wiring idempotent regardless of
-#     whether the brain app was just created or already existed.
+# 5b. Phase 2: roll the freshly-built brain image + (re)assert its Foundry/
+#     Storage env vars. `--set-env-vars` is an upsert and `--image` rolls a new
+#     revision, so this is rerun-safe whether the brain app was just created
+#     above or already existed -- it's what makes a plain `provision.sh` rerun
+#     also redeploy current brain code.
 #
 #     New outbound egress this introduces for the brain (beyond Service Bus):
 #     *.services.ai.azure.com (Foundry) and *.table.core.windows.net
@@ -278,6 +254,7 @@ az containerapp create \
 #     when that seam is picked up.
 # ---------------------------------------------------------------------------
 az containerapp update -g "$RG" -n "$BRAIN_APP" \
+  --image "$BRAIN_IMAGE" \
   --set-env-vars \
     "FOUNDRY_PROJECT_ENDPOINT=${FOUNDRY_ENDPOINT}" \
     "FOUNDRY_MODEL=${FOUNDRY_MODEL}" \
@@ -286,6 +263,71 @@ az containerapp update -g "$RG" -n "$BRAIN_APP" \
   >/dev/null
 
 RELAY_FQDN=$(az containerapp show -g "$RG" -n "$RELAY_APP" --query properties.configuration.ingress.fqdn -o tsv)
+
+# ---------------------------------------------------------------------------
+# 5c. Phase 3: mock MCP servers (Jenkins/Datadog/Argo CD), one codebase deployed
+#     3x, each with INTERNAL ingress only -- these mirror "Jenkins MCP in-cluster,
+#     never public" from the design doc (docs/phase-3-mcp-investigation.md).
+#     No secrets, no inbound from the internet: the brain reaches them over the
+#     CAE's private network, same as any two container apps in one environment.
+#     `--ingress internal` + `--target-port` confirmed against the current
+#     `az containerapp create --help` (allowed ingress values: external,
+#     internal); the internal FQDN pattern
+#     (`<app>.internal.<environment-unique-id>.<region>.azurecontainerapps.io`)
+#     is confirmed against Microsoft Learn's "Communicate between container
+#     apps" doc, "External and internal FQDNs" table -- confirmed rather than
+#     assumed, per this repo's ethos of verifying az/API surfaces.
+# ---------------------------------------------------------------------------
+echo "-- mock MCP servers (jenkins/datadog/argocd) --"
+MOCK_IMAGE="$(build_image mockmcp "${SCRIPT_DIR}/../mock-mcp")"
+
+deploy_mock_mcp() {
+  local app="$1" kind="$2" port="$3"
+  ensure_app_created "$app" \
+    --environment "$CAE_NAME" \
+    --image "$MOCK_IMAGE" \
+    --registry-server "$ACR_LOGIN_SERVER" --registry-identity "$BRAIN_RESOURCE_ID" \
+    --user-assigned "$BRAIN_RESOURCE_ID" \
+    --ingress internal --target-port "$port" \
+    --min-replicas 1 --max-replicas 1 \
+    --env-vars \
+      "MCP_SERVER_KIND=${kind}" \
+      "PORT=${port}"
+  # Roll the freshly-built image on rerun (create above is skipped if the app
+  # already exists). MCP_SERVER_KIND/PORT are create-time and stable, so an
+  # image-only update preserves them.
+  roll_image "$app" "$MOCK_IMAGE"
+}
+
+deploy_mock_mcp "$MCP_JENKINS_APP" jenkins "$MCP_JENKINS_PORT"
+deploy_mock_mcp "$MCP_DATADOG_APP" datadog "$MCP_DATADOG_PORT"
+deploy_mock_mcp "$MCP_ARGOCD_APP" argocd "$MCP_ARGOCD_PORT"
+
+CAE_DEFAULT_DOMAIN=$(az containerapp env show -g "$RG" -n "$CAE_NAME" --query properties.defaultDomain -o tsv)
+JENKINS_MCP_URL="https://${MCP_JENKINS_APP}.internal.${CAE_DEFAULT_DOMAIN}/mcp"
+DATADOG_MCP_URL="https://${MCP_DATADOG_APP}.internal.${CAE_DEFAULT_DOMAIN}/mcp"
+ARGOCD_MCP_URL="https://${MCP_ARGOCD_APP}.internal.${CAE_DEFAULT_DOMAIN}/mcp"
+
+# Upsert on the brain, same idempotent pattern as 5b: `--set-env-vars` is a
+# rerun-safe upsert regardless of whether the brain app was just created above
+# or already existed. ARGOCD_MCP_URL is set even though brain/mcp_tools.json's
+# default registry doesn't list an "argocd" entry -- mcp_registry.py skips any
+# entry not present in the config, so this is harmless and means the
+# acceptance-#2 demo (add a 3rd server) is a pure mcp_tools.json edit + brain
+# image rebuild, no infra change.
+#
+# New outbound egress this introduces for the brain: the three mock MCP apps'
+# internal FQDNs above (*.internal.${CAE_DEFAULT_DOMAIN}) -- same deferred
+# egress-allowlist seam noted in step 5b/the Phase 1 VNet comments; traffic to
+# these stays inside the CAE regardless; noting it here for when that seam is
+# picked up.
+az containerapp update -g "$RG" -n "$BRAIN_APP" \
+  --set-env-vars \
+    "JENKINS_MCP_URL=${JENKINS_MCP_URL}" \
+    "DATADOG_MCP_URL=${DATADOG_MCP_URL}" \
+    "ARGOCD_MCP_URL=${ARGOCD_MCP_URL}" \
+    "TOOL_CALL_BUDGET=8" \
+  >/dev/null
 
 # ---------------------------------------------------------------------------
 # 6. Point the bot at the relay, and set the relay's ingress allowlist -- as
@@ -340,3 +382,6 @@ echo "BOT_TENANT_ID:          ${TENANT_ID}"
 echo "Service Bus namespace:  ${SB_FQNS}"
 echo "Storage account:        ${ST_ACCOUNT} (table: interviews)"
 echo "Foundry endpoint:       ${FOUNDRY_ENDPOINT} (model: ${FOUNDRY_MODEL})"
+echo "Mock MCP servers:       ${JENKINS_MCP_URL}"
+echo "                        ${DATADOG_MCP_URL}"
+echo "                        ${ARGOCD_MCP_URL} (not in default mcp_tools.json registry)"

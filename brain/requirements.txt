@@ -17,3 +17,9 @@ pydantic>=2.11,<3
 # NOTE: leave pydantic as a range (>=2.11) above; a hard pin makes pip backtrack
 # agent-framework and fail resolution.
 agent-framework==1.10.0
+
+# Phase 3 (MCP investigation): no new deps. MCPStreamableHTTPTool and the
+# transitive `mcp` SDK dependency both ship inside the `agent-framework`
+# meta-package already pinned above; brain/mcp_registry.py and
+# brain/investigation.py only add stdlib (json/re/pathlib/contextlib) and
+# pydantic models on top of what's already here.

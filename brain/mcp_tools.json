@@ -1,0 +1,6 @@
+{
+  "servers": [
+    {"name": "jenkins", "url": "${JENKINS_MCP_URL}", "description": "Jenkins CI — read deploy job parameters (target env/version) and build logs."},
+    {"name": "datadog", "url": "${DATADOG_MCP_URL}", "description": "Datadog — k8s pod status, version/deploy events, error rate and error logs."}
+  ]
+}

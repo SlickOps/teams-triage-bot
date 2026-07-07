@@ -13,6 +13,7 @@ from botframework.connector.auth import ClaimsIdentity
 from cards import build_intake_card, parse_card_submit
 from intake import IntakeField, StructuredSummary
 from interviewer import InterviewerError, run_turn
+from investigation import InvestigationError, InvestigationReport, run_investigation
 from redact import redact
 from reply import build_adapter, send_card, send_text
 from state_store import InterviewState, build_state_store
@@ -24,6 +25,11 @@ _NAMESPACE = os.environ["SERVICEBUS_FULLY_QUALIFIED_NAMESPACE"]
 _QUEUE_NAME = os.environ.get("SERVICE_BUS_QUEUE_NAME", "activities")
 _TENANT_ID = os.environ["BOT_TENANT_ID"]
 _APP_ID = os.environ["BOT_APP_ID"]
+
+# Interview lifecycle states that count as "finished" -- a new free-text message
+# while in one of these starts a fresh incident (see handle_envelope). Keep in
+# sync with the statuses set in _run_interview_turn / _run_investigation_step.
+_TERMINAL_STATUSES = {"complete", "investigated"}
 
 _INTRO_LINE = (
     "Got it -- let's nail down the specifics. I've dropped a quick form below; "
@@ -62,6 +68,38 @@ def _render_summary_markdown(summary: StructuredSummary) -> str:
     lines.append(f"**What we know:** {summary.what_we_know}")
     if summary.open_questions:
         lines.append(f"**Open questions:** {summary.open_questions}")
+    return "\n\n".join(lines)
+
+
+def _render_investigation_markdown(report: InvestigationReport) -> str:
+    """Render an InvestigationReport into a Teams-friendly markdown message.
+    Rendering is pure string assembly from typed fields -- it never echoes
+    raw tool output directly, and everything here still passes through
+    redact() before being sent (docs/00-overview.md guardrail #6), same as
+    _render_summary_markdown above. There is deliberately no "act on this"
+    step: nothing here becomes an @mention or a routing decision (that's
+    Phase 4, and even then it comes from the ownership map, never from this
+    text) -- see docs/00-overview.md guardrail #2."""
+    lines = [f"**Investigation: {report.environment} / {report.service}**"]
+    if report.change:
+        lines.append(f"**Deploy/change:** {report.change}")
+    lines.append(f"**Impact:** {report.impact}")
+    lines.append(f"**Hypothesis (unconfirmed):** {report.hypothesis}")
+    if report.evidence:
+        # Compact clickable citations on ONE line -- links where we have a URL,
+        # bare labels otherwise. Deliberately NOT the detail text: the body must
+        # stay short (a wall of text gets ignored), and the actual facts already
+        # live in change/impact/hypothesis. ev.detail is still kept in the stored
+        # report for a richer view later (e.g. an Adaptive Card of evidence).
+        cites = " · ".join(
+            f"[{ev.label}]({ev.ref})" if ev.ref else ev.label
+            for ev in report.evidence
+        )
+        lines.append(f"**Evidence:** {cites}")
+    if report.injection_flagged:
+        lines.append("⚠️ A tool log contained a prompt-injection attempt; treated as data, not acted on.")
+    if report.tools_unavailable:
+        lines.append(f"**Tools unavailable:** {', '.join(report.tools_unavailable)}")
     return "\n\n".join(lines)
 
 
@@ -127,13 +165,55 @@ async def _run_interview_turn(turn_context, state: InterviewState, store) -> Non
     state.intake = turn.intake
     state.transcript.append({"role": "bot", "text": turn.reply_to_user})
 
-    if turn.enough_to_be_useful and turn.summary is not None:
-        state.status = "complete"
+    if not (turn.enough_to_be_useful and turn.summary is not None):
         await send_text(turn_context, redact(turn.reply_to_user))
-        await send_text(turn_context, redact(_render_summary_markdown(turn.summary)))
-    else:
-        await send_text(turn_context, redact(turn.reply_to_user))
+        await store.put(state)
+        return
 
+    state.status = "complete"
+    await send_text(turn_context, redact(turn.reply_to_user))
+    await send_text(turn_context, redact(_render_summary_markdown(turn.summary)))
+    await store.put(state)
+    # Chained here (rather than left to the next inbound message) so the
+    # investigation runs immediately once the interview has enough to go on
+    # -- see _run_investigation_step's docstring for why its own persistence
+    # and failure handling are split out from the interview's.
+    await _run_investigation_step(turn_context, state, store, turn.summary)
+
+
+async def _run_investigation_step(turn_context, state: InterviewState, store, summary: StructuredSummary) -> None:
+    """Phase 3: once the interview produced a usable summary, hand it to the
+    MCP-backed investigator and post the result. Split out from
+    _run_interview_turn so the interview's own persistence (state.status=
+    "complete") is already durable before we attempt the (network-heavy,
+    more failure-prone) investigation step -- a failure here should not cost
+    the user the summary they already have.
+
+    Same InvestigationError-catch-and-degrade shape as run_turn's
+    InterviewerError handling above: a deterministic model/tool failure gets
+    ONE apologetic message and the turn ends cleanly, rather than re-raising
+    (which would abandon the queue message and redeliver up to 10x, per
+    _run_interview_turn's docstring)."""
+    await send_text(
+        turn_context,
+        redact(f"\U0001f50d Investigating {summary.environment}/{summary.service}..."),
+    )
+    try:
+        report = await run_investigation(summary)
+    except InvestigationError:
+        logger.exception("investigation failed for user %s", state.user_id)
+        await send_text(
+            turn_context,
+            redact(
+                "I couldn't complete the investigation (hit a snag reaching my tools or "
+                "brain) -- the summary above is still good; a human can take it from there."
+            ),
+        )
+        return
+
+    state.status = "investigated"
+    state.investigation_report = report.model_dump_json()
+    await send_text(turn_context, redact(_render_investigation_markdown(report)))
     await store.put(state)
 
 
@@ -166,7 +246,15 @@ async def handle_envelope(adapter, store, envelope: dict) -> None:
     is_card_submit = isinstance(activity.value, dict) and bool(activity.value)
 
     state = await store.get(user_id)
-    if state is None or (state.status == "complete" and not is_card_submit):
+    # A fresh free-text message after an interview has reached a TERMINAL state
+    # starts a brand-new incident. Both "complete" (summary produced) and
+    # "investigated" (Phase 3 investigation also done) are terminal -- the bug
+    # this guards against: omitting "investigated" meant that once an interview
+    # had been investigated, the next report reused the old transcript/intake and
+    # merged the two incidents (e.g. an earlier "500 in browser" symptom bleeding
+    # into a new, unrelated environment). A card submit is NOT a new incident --
+    # it's answers to the card we just sent, so it never resets.
+    if state is None or (state.status in _TERMINAL_STATUSES and not is_card_submit):
         state = InterviewState(user_id=user_id)
 
     if is_card_submit:
