@@ -12,14 +12,23 @@ pydantic>=2.11,<3
 
 # MAF: pinned to the version verified live against Foundry gpt-5-mini (structured
 # output via ChatOptions.response_format, FoundryChatClient, the InterviewTurn
-# round-trip). The bare `agent-framework` meta-package includes agent_framework.foundry
-# (confirmed) -- no separate agent-framework-foundry / azure-ai-projects needed.
+# round-trip).
+#
+# We depend on the SPECIFIC sub-packages we import rather than the convenience
+# meta-package `agent-framework`. That meta-package resolves to
+# agent-framework-core[all], whose "all" extra fans out to ~25 sibling packages
+# with NO version pins. Any sibling publishing a release that requires a newer
+# core (agent-framework-a2a did, needing core>=1.13) makes a pinned 1.10.0 build
+# fail with ResolutionImpossible -- a build that breaks with zero repo changes.
+# Naming the sub-packages keeps the pin reproducible and the image smaller.
+#
+# These three cover every agent_framework symbol brain/ imports:
+#   core     -> Agent, ChatOptions, FunctionInvocationContext, MCPStreamableHTTPTool
+#   foundry  -> agent_framework.foundry.FoundryChatClient
+#   mcp      -> the MCP SDK that MCPStreamableHTTPTool needs at runtime (it is
+#               only in core's "all" extra, so it must be requested explicitly).
 # NOTE: leave pydantic as a range (>=2.11) above; a hard pin makes pip backtrack
 # agent-framework and fail resolution.
-agent-framework==1.10.0
-
-# Phase 3 (MCP investigation): no new deps. MCPStreamableHTTPTool and the
-# transitive `mcp` SDK dependency both ship inside the `agent-framework`
-# meta-package already pinned above; brain/mcp_registry.py and
-# brain/investigation.py only add stdlib (json/re/pathlib/contextlib) and
-# pydantic models on top of what's already here.
+agent-framework-core==1.10.0
+agent-framework-foundry==1.10.0
+mcp>=1.24.0,<2

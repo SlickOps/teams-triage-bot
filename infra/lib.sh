@@ -104,7 +104,22 @@ acr_login_server() {
 build_image() {
   local repo="$1" src="$2"
   local server="${ACR_LOGIN_SERVER:-$(acr_login_server)}"
-  az acr build -r "$ACR_NAME" -t "${repo}:${BUILD_TAG}" -t "${repo}:latest" "$src" >/dev/null
+  # Check the build's exit status EXPLICITLY. `set -e` does not save us here:
+  # this function is called inside "$(...)", and az acr build has been observed
+  # to exit 0 even when the run failed ("ERROR: Run failed" on stderr). Without
+  # this guard a failed build still echoed a tag, and the caller happily rolled
+  # the app to an image that was never pushed.
+  if ! az acr build -r "$ACR_NAME" -t "${repo}:${BUILD_TAG}" -t "${repo}:latest" "$src" >/dev/null; then
+    echo "ERROR: ACR build failed for ${repo} (see output above); not rolling." >&2
+    return 1
+  fi
+  # Belt and braces for the exit-0-on-failure case: confirm the tag really
+  # exists in the registry before anyone deploys it.
+  if ! az acr repository show-tags -n "$ACR_NAME" --repository "$repo" \
+       --query "[?@=='${BUILD_TAG}'] | [0]" -o tsv 2>/dev/null | grep -q .; then
+    echo "ERROR: ${repo}:${BUILD_TAG} not found in ${ACR_NAME} after build; not rolling." >&2
+    return 1
+  fi
   echo "${server}/${repo}:${BUILD_TAG}"
 }
 
