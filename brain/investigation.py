@@ -19,7 +19,9 @@ Guardrail mapping (docs/00-overview.md):
                                      4); this phase's output is a report, not
                                      an action.
   #3 no autonomous root cause     -> NO root_cause field on InvestigationReport;
-                                     hypothesis + hypothesis_label instead.
+                                     just a `hypothesis` field, which the
+                                     rendering step (_render_investigation_markdown
+                                     in app.py) labels "Hypothesis (unconfirmed)".
   #5 tool-call budget cap         -> _budget_middleware() below.
   #6 output redaction             -> enforced by the caller (app.py), same as
                                      Phase 2: this module returns structured
@@ -157,28 +159,18 @@ class InvestigationError(Exception):
 def _budget_middleware(budget: int):
     """Build a function-level (tool-call) middleware closure that counts tool
     calls and, once the budget is exhausted, blocks further calls with a
-    message telling the model to wrap up -- belt-and-suspenders alongside the
-    native cap set in _get_client() below.
+    message telling the model to wrap up. This IS the tool-call budget's
+    enforcement (docs/00-overview.md guardrail #5), not a backstop.
 
-    Verified (not assumed) via ctx7 + a local, offline instantiation of
-    FoundryChatClient (no network call -- just checking the object's
-    attributes): FoundryChatClient inherits FunctionInvocationLayer
-    (`FoundryChatClient.__mro__` includes it), and
-    `client.function_invocation_configuration["max_function_calls"]` is a
-    real, working knob on it -- confirmed by constructing a FoundryChatClient
-    with dummy creds/endpoint and reading back
-    `client.function_invocation_configuration` (default
-    `{"max_iterations": 40, "max_function_calls": None, ...}`, settable).
-    docs/phase-3-mcp-investigation.md's own instruction was to hand-roll a
-    middleware "even if MAF has no native knob" -- it turns out there IS one,
-    so _get_client() sets it as the primary enforcement (the framework's own
-    docstring for FunctionInvocationConfiguration says hitting
-    max_function_calls "stops invoking tools and forces the model to produce
-    a text response", which is exactly graceful degradation for free). This
-    middleware stays as a second, independent layer: it doesn't rely on that
-    framework internal remaining stable, and it gives us a log line the
-    moment the budget is hit (the native knob fails silently from the
-    caller's point of view).
+    Per-run guarantee: the closure owns its own `state["count"]`, and
+    _build_agent() builds a fresh middleware per run, so every investigation
+    starts at zero and gets its full budget. We deliberately do NOT lean on
+    FoundryChatClient's native max_function_calls knob (a real, settable field
+    -- verified via ctx7 -- but living on the shared singleton client): the
+    framework doesn't document whether that counter resets per agent.run, so
+    relying on it risks later investigations silently getting zero tool calls
+    after the first exhausts it. The per-run middleware sidesteps that entirely
+    and also gives us a log line the moment the budget is hit.
 
     Contract: `async def middleware(context, call_next) -> None`. To allow a
     call through, `await call_next()`. To block it, simply don't call
@@ -264,15 +256,15 @@ def _get_client():
             project_endpoint=_FOUNDRY_PROJECT_ENDPOINT,
             model=_FOUNDRY_MODEL,
         )
-        # Primary enforcement of the tool-call budget (docs/00-overview.md
-        # guardrail #5) -- see _budget_middleware's docstring for how this
-        # was verified to actually exist on FoundryChatClient. Setting
-        # max_iterations too (same budget, generously) bounds LLM roundtrips
-        # as well as raw tool-call count, in case a run somehow burns many
-        # roundtrips without hitting max_function_calls (e.g. the model
-        # replying with empty tool batches).
-        _client.function_invocation_configuration["max_function_calls"] = TOOL_CALL_BUDGET
-        _client.function_invocation_configuration["max_iterations"] = TOOL_CALL_BUDGET
+        # Deliberately NOT setting function_invocation_configuration's native
+        # max_function_calls/max_iterations here: this client is a shared
+        # singleton, and agent-framework doesn't document whether that counter
+        # resets per agent.run or accumulates across runs. If it accumulated,
+        # the first investigation would consume the budget and later ones would
+        # silently get zero tool calls. The budget is instead enforced by the
+        # per-run middleware counter (see _build_agent / _budget_middleware),
+        # which is rebuilt fresh every run and so is robust regardless of the
+        # shared client's reset semantics.
     return _client
 
 

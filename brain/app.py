@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
+from urllib.parse import urlparse
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.servicebus.aio import ServiceBusClient
@@ -11,9 +12,11 @@ from botbuilder.schema import Activity
 from botframework.connector.auth import ClaimsIdentity
 
 from cards import build_intake_card, parse_card_submit
+from followup import FollowupError, run_followup
 from intake import IntakeField, StructuredSummary
 from interviewer import InterviewerError, run_turn
 from investigation import InvestigationError, InvestigationReport, run_investigation
+from lifecycle import is_new_incident, is_retry_request
 from redact import redact
 from reply import build_adapter, send_card, send_text
 from state_store import InterviewState, build_state_store
@@ -35,6 +38,23 @@ _INTRO_LINE = (
     "Got it -- let's nail down the specifics. I've dropped a quick form below; "
     "fill in what you can (blanks are fine if something genuinely doesn't apply -- "
     "just tell me why in chat)."
+)
+
+# A submit arrived from a form belonging to an already-finished interview. Its
+# fields still carry the *previous* incident's answers, so we deliberately don't
+# merge them (that's what mixed two incidents together before).
+_STALE_CARD_LINE = (
+    "That form was from an earlier report, so I left the previous one as-is. "
+    "If this is a new issue, just tell me what's happening (or say \"new issue\") "
+    "and I'll start a fresh report."
+)
+
+# Shown when an interview is "complete" but its investigation failed and the
+# user sends something that's neither a retry request nor a new incident.
+_COMPLETE_NUDGE_LINE = (
+    "That report is summarized above, but I couldn't finish the investigation. "
+    "Reply \"retry\" and I'll take another run at it, or describe a new problem "
+    "to start a fresh report."
 )
 
 
@@ -71,6 +91,30 @@ def _render_summary_markdown(summary: StructuredSummary) -> str:
     return "\n\n".join(lines)
 
 
+# label/ref on an Evidence are model-controlled, and the model reads untrusted
+# tool logs -- so a copied injection string could otherwise smuggle Teams
+# mention/link markup into a citation. These keep a citation inert text, upholding
+# the "rendering never becomes an action" guardrail (docs/00-overview.md #2).
+_LABEL_MD_ESCAPE = str.maketrans({c: "\\" + c for c in "\\`*_[]()<>~|!#"})
+
+
+def _sanitize_label(label: str) -> str:
+    """Neutralize markdown/mention metacharacters so a label can't open a link,
+    image, code span, or HTML. '@' is split with a zero-width space so a copied
+    "@everyone" can't read as a mention."""
+    return label.translate(_LABEL_MD_ESCAPE).replace("@", "@\u200b")
+
+
+def _safe_ref(ref: str | None) -> str | None:
+    """Allowlist real http(s) URLs as the only thing that may become a clickable
+    link; anything else (javascript:/data:, a bare id, a model-invented scheme)
+    is dropped so the citation degrades to an inert label."""
+    if not ref:
+        return None
+    parsed = urlparse(ref)
+    return ref if parsed.scheme in ("http", "https") and parsed.netloc else None
+
+
 def _render_investigation_markdown(report: InvestigationReport) -> str:
     """Render an InvestigationReport into a Teams-friendly markdown message.
     Rendering is pure string assembly from typed fields -- it never echoes
@@ -92,7 +136,7 @@ def _render_investigation_markdown(report: InvestigationReport) -> str:
         # live in change/impact/hypothesis. ev.detail is still kept in the stored
         # report for a richer view later (e.g. an Adaptive Card of evidence).
         cites = " · ".join(
-            f"[{ev.label}]({ev.ref})" if ev.ref else ev.label
+            f"[{_sanitize_label(ev.label)}]({ref})" if (ref := _safe_ref(ev.ref)) else _sanitize_label(ev.label)
             for ev in report.evidence
         )
         lines.append(f"**Evidence:** {cites}")
@@ -171,6 +215,9 @@ async def _run_interview_turn(turn_context, state: InterviewState, store) -> Non
         return
 
     state.status = "complete"
+    # Persist the summary so a failed investigation can be retried from it
+    # (see the "complete" branch in handle_envelope) without re-interviewing.
+    state.structured_summary = turn.summary.model_dump_json()
     await send_text(turn_context, redact(turn.reply_to_user))
     await send_text(turn_context, redact(_render_summary_markdown(turn.summary)))
     await store.put(state)
@@ -206,7 +253,8 @@ async def _run_investigation_step(turn_context, state: InterviewState, store, su
             turn_context,
             redact(
                 "I couldn't complete the investigation (hit a snag reaching my tools or "
-                "brain) -- the summary above is still good; a human can take it from there."
+                "brain) -- the summary above is still good; a human can take it from there. "
+                "Reply \"retry\" and I'll take another run at it."
             ),
         )
         return
@@ -217,9 +265,24 @@ async def _run_investigation_step(turn_context, state: InterviewState, store, su
     await store.put(state)
 
 
+async def _reply_once(adapter, store, state, activity, claims, audience, callback) -> None:
+    """Run `callback` inside a proactive turn, then durably record this activity
+    as completed on the user's state row and put() once more. That durable
+    marker (unlike _seen_activity_ids, which dies with the process) makes a
+    redelivery after a pod restart a no-op. The put also refreshes the state's
+    TTL. It re-persists any mutations the callback made to `state`."""
+    claims_identity = ClaimsIdentity(claims=claims, is_authenticated=True)
+    await adapter.process_proactive(claims_identity, activity, audience, callback)
+    state.last_completed_activity_id = activity.id
+    await store.put(state)
+    _mark_seen(activity.id)
+    logger.info("replied to activity %s", activity.id)
+
+
 async def handle_envelope(adapter, store, envelope: dict) -> None:
     activity = Activity.deserialize(envelope["activity"])
     claims = envelope["claims"]
+    audience = envelope["audience"]
 
     # Re-validate what the relay handed us -- defense in depth, since the brain
     # can't re-check the original JWT signature after the queue hop. Channel
@@ -237,52 +300,114 @@ async def handle_envelope(adapter, store, envelope: dict) -> None:
     if activity.type != "message":
         logger.info("dropping activity %s: not a message activity (type=%s)", activity.id, activity.type)
         return
+    if activity.from_property is None:
+        # A well-formed message activity always carries a sender. A malformed one
+        # would otherwise raise in _activity_user_id and abandon->redeliver in a
+        # loop until dead-letter; drop it like the other validation failures.
+        logger.warning("dropping activity %s: missing from_property (sender identity)", activity.id)
+        return
 
-    if activity.id in _seen_activity_ids:
+    if activity.id in _seen_activity_ids:  # in-process fast path
         logger.info("skipping already-processed activity %s", activity.id)
         return
 
     user_id = _activity_user_id(activity)
     is_card_submit = isinstance(activity.value, dict) and bool(activity.value)
+    # In channels the incoming text includes the "@Bot Name" mention markup;
+    # strip it so we only see what the user actually typed.
+    user_text = "" if is_card_submit else (
+        TurnContext.remove_recipient_mention(activity) or activity.text or ""
+    ).strip()
 
+    # Storage errors now propagate (state_store.get only swallows "not found"),
+    # so a transient Table outage abandons the message for redelivery rather
+    # than looking like "no interview" and wiping one in progress.
     state = await store.get(user_id)
-    # A fresh free-text message after an interview has reached a TERMINAL state
-    # starts a brand-new incident. Both "complete" (summary produced) and
-    # "investigated" (Phase 3 investigation also done) are terminal -- the bug
-    # this guards against: omitting "investigated" meant that once an interview
-    # had been investigated, the next report reused the old transcript/intake and
-    # merged the two incidents (e.g. an earlier "500 in browser" symptom bleeding
-    # into a new, unrelated environment). A card submit is NOT a new incident --
-    # it's answers to the card we just sent, so it never resets.
-    if state is None or (state.status in _TERMINAL_STATUSES and not is_card_submit):
+
+    # Durable dedup: this exact activity was already fully handled. Survives the
+    # restart that _seen_activity_ids does not.
+    if state is not None and activity.id == state.last_completed_activity_id:
+        logger.info("skipping already-completed activity %s (durable marker)", activity.id)
+        _mark_seen(activity.id)
+        return
+
+    # A free-text message on a TERMINAL interview that looks like a genuinely new
+    # problem starts a fresh incident. This replaces the old "any message after
+    # terminal resets" rule, which merged unrelated incidents (an earlier symptom
+    # bleeding into a new environment). Card submits carry no fresh description,
+    # so they never trigger this -- a stale one is handled just below instead.
+    if (
+        not is_card_submit
+        and state is not None
+        and state.status in _TERMINAL_STATUSES
+        and is_new_incident(user_text, state)
+    ):
+        state = InterviewState(user_id=user_id)
+    elif state is None:
         state = InterviewState(user_id=user_id)
 
-    if is_card_submit:
-        # Receiving a submit means the card was already shown -- mark it sent so
-        # a turn on freshly-created state (e.g. after TTL expiry or an in-memory
-        # fallback restart lost the row) processes the answers instead of
-        # re-sending the card and throwing away what the user just submitted.
-        state.card_sent = True
-        answers = parse_card_submit(activity.value)
-        for field_name, text in answers.items():
-            setattr(state.intake, field_name, IntakeField(value=text))
-        rendered = ", ".join(f"{k}={v}" for k, v in answers.items()) or "(no fields filled in)"
-        state.transcript.append({"role": "user", "text": f"Card answers: {rendered}"})
-    else:
-        # In channels the incoming text includes the "@Bot Name" mention markup;
-        # strip it so we only see what the user actually typed.
-        text = TurnContext.remove_recipient_mention(activity) or activity.text or ""
-        state.transcript.append({"role": "user", "text": text.strip()})
+    # --- Short-circuit lifecycle branches (no interview turn) ---
 
-    async def _callback(turn_context) -> None:
+    if is_card_submit and state.status in _TERMINAL_STATUSES:
+        # Stale card from a finished interview: don't merge its previous-incident
+        # values; nudge toward a fresh report.
+        async def _stale_cb(turn_context) -> None:
+            await send_text(turn_context, redact(_STALE_CARD_LINE))
+        await _reply_once(adapter, store, state, activity, claims, audience, _stale_cb)
+        return
+
+    if not is_card_submit and state.status == "investigated":
+        # Post-investigation follow-up: answer from the stored summary + report
+        # only (no MCP, no re-intake). Same catch-and-degrade shape as the
+        # interviewer so a transient model blip doesn't redeliver 10x.
+        async def _followup_cb(turn_context) -> None:
+            try:
+                answer = await run_followup(state, user_text)
+            except FollowupError:
+                logger.exception("follow-up failed for user %s", state.user_id)
+                answer = "I hit a snag pulling that up -- please ask again in a moment."
+            await send_text(turn_context, redact(answer))
+        await _reply_once(adapter, store, state, activity, claims, audience, _followup_cb)
+        return
+
+    if not is_card_submit and state.status == "complete":
+        # Interview finished but investigation failed. Retry ONLY when asked,
+        # reusing the stored summary so the reporter skips intake.
+        if is_retry_request(user_text) and state.structured_summary:
+            summary = StructuredSummary.model_validate_json(state.structured_summary)
+
+            async def _retry_cb(turn_context) -> None:
+                await _run_investigation_step(turn_context, state, store, summary)
+            await _reply_once(adapter, store, state, activity, claims, audience, _retry_cb)
+        else:
+            async def _nudge_cb(turn_context) -> None:
+                await send_text(turn_context, redact(_COMPLETE_NUDGE_LINE))
+            await _reply_once(adapter, store, state, activity, claims, audience, _nudge_cb)
+        return
+
+    # --- Normal interview turn (interviewing, or a fresh new-incident state) ---
+    # Incorporate this activity into state, unless we're resuming an activity we
+    # already started before a crash: its user turn is already persisted, so
+    # re-appending would duplicate it (and corrupt the interviewer's context).
+    resuming = activity.id == state.last_started_activity_id
+    if not resuming:
+        state.last_started_activity_id = activity.id
+        if is_card_submit:
+            # A submit means the card was already shown -- mark it sent so a turn
+            # on freshly-created state (TTL expiry / in-memory restart lost the
+            # row) processes the answers instead of re-sending the card.
+            state.card_sent = True
+            answers = parse_card_submit(activity.value)
+            for field_name, text in answers.items():
+                setattr(state.intake, field_name, IntakeField(value=text))
+            rendered = ", ".join(f"{k}={v}" for k, v in answers.items()) or "(no fields filled in)"
+            state.transcript.append({"role": "user", "text": f"Card answers: {rendered}"})
+        else:
+            state.transcript.append({"role": "user", "text": user_text})
+
+    async def _interview_cb(turn_context) -> None:
         await _run_interview_turn(turn_context, state, store)
-
-    claims_identity = ClaimsIdentity(claims=claims, is_authenticated=True)
-    await adapter.process_proactive(claims_identity, activity, envelope["audience"], _callback)
-    # Mark seen only after a successful reply: marking earlier would make a
-    # redelivery of a crashed attempt complete without ever replying.
-    _mark_seen(activity.id)
-    logger.info("replied to activity %s", activity.id)
+    await _reply_once(adapter, store, state, activity, claims, audience, _interview_cb)
 
 
 async def main() -> None:
@@ -290,7 +415,14 @@ async def main() -> None:
     store = build_state_store()
     credential = DefaultAzureCredential()
     async with ServiceBusClient(_NAMESPACE, credential) as client:
-        async with client.get_queue_receiver(_QUEUE_NAME) as receiver:
+        # handle_envelope chains intake completion into a multi-tool Foundry
+        # investigation in-process, which can outrun the SDK's default 5-min
+        # peek-lock auto-renewal and let the message redeliver mid-flight. Renew
+        # locks well past worst-case investigation time (value is seconds); a
+        # lock genuinely lost past that still surfaces through the except below.
+        async with client.get_queue_receiver(
+            _QUEUE_NAME, max_auto_lock_renewal_duration=600
+        ) as receiver:
             logger.info("listening on queue %s", _QUEUE_NAME)
             async for msg in receiver:
                 try:

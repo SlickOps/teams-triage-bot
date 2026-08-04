@@ -45,14 +45,16 @@ def _interpolate(url_template: str) -> str:
     return _VAR_RE.sub(_sub, url_template)
 
 
-def load_server_configs(config_path: Path = _CONFIG_PATH) -> list[dict]:
-    """Load mcp_tools.json and return the entries whose URL resolves to a
-    non-empty string, with the URL already interpolated. Entries with an
-    empty/unset URL are logged and skipped -- see module docstring."""
+def _resolve_servers(config_path: Path) -> tuple[list[dict], list[str]]:
+    """Load mcp_tools.json and split its entries by whether their URL
+    resolves. Returns (resolved, skipped_names): `resolved` are entries with a
+    non-empty interpolated URL; `skipped_names` are servers present in config
+    but skipped because their URL env var is unset/empty -- callers surface
+    those in tools_unavailable so degradation isn't silently under-reported."""
     with open(config_path) as f:
         raw = json.load(f)
 
-    resolved = []
+    resolved, skipped = [], []
     for entry in raw.get("servers", []):
         name = entry["name"]
         url = _interpolate(entry["url"])
@@ -62,24 +64,32 @@ def load_server_configs(config_path: Path = _CONFIG_PATH) -> list[dict]:
                 "(server not deployed/configured yet)",
                 name,
             )
+            skipped.append(name)
             continue
         resolved.append({"name": name, "url": url, "description": entry.get("description", "")})
-    return resolved
+    return resolved, skipped
 
 
-def build_tools(config_path: Path = _CONFIG_PATH):
-    """Build one MCPStreamableHTTPTool per configured (and resolvable) server.
-    Does not connect -- see module docstring. Returns [] if no server has a
-    usable URL (e.g. local dev with nothing set), which is a valid state: the
-    investigator agent still runs, just with no tools attached, and its
-    prompt/report degrade via tools_unavailable."""
+def load_server_configs(config_path: Path = _CONFIG_PATH) -> list[dict]:
+    """Load mcp_tools.json and return the entries whose URL resolves to a
+    non-empty string, with the URL already interpolated. Entries with an
+    empty/unset URL are logged and skipped -- see module docstring."""
+    return _resolve_servers(config_path)[0]
+
+
+def build_tools(servers: list[dict]):
+    """Build one MCPStreamableHTTPTool per resolved server (from
+    _resolve_servers/load_server_configs). Does not connect -- see module
+    docstring. Returns [] for an empty list (e.g. local dev with nothing set),
+    which is a valid state: the investigator agent still runs, just with no
+    tools attached, and its prompt/report degrade via tools_unavailable."""
     # Imported lazily, matching interviewer.py's lazy-import style: modules
     # that only inspect config (e.g. selfcheck_phase3.py) shouldn't need
     # agent-framework installed.
     from agent_framework import MCPStreamableHTTPTool
 
     tools = []
-    for server in load_server_configs(config_path):
+    for server in servers:
         tools.append(
             MCPStreamableHTTPTool(
                 name=server["name"],
@@ -106,10 +116,13 @@ class ToolLifecycle:
     is the standard way to enter a variable number of context managers and
     still guarantee every already-entered one is closed on the way out.
 
-    Graceful degradation: a server that fails to connect is recorded in
-    `.unavailable` (by name) and simply excluded from `.tools`, rather than
-    aborting the whole investigation. investigation.py surfaces
-    `.unavailable` in InvestigationReport.tools_unavailable.
+    Graceful degradation: `.unavailable` (by name) collects both servers that
+    were skipped at config load (URL env var unset) and servers that failed to
+    connect -- either way they're excluded from `.tools` rather than aborting
+    the investigation. Surfacing the config-skipped ones too keeps the report
+    honest (the model isn't tempted to invent evidence for a tool it never
+    had). investigation.py surfaces `.unavailable` in
+    InvestigationReport.tools_unavailable.
     """
 
     def __init__(self, config_path: Path = _CONFIG_PATH):
@@ -121,7 +134,9 @@ class ToolLifecycle:
     async def __aenter__(self) -> "ToolLifecycle":
         self._stack = AsyncExitStack()
         await self._stack.__aenter__()
-        for tool in build_tools(self._config_path):
+        resolved, skipped = _resolve_servers(self._config_path)
+        self.unavailable.extend(skipped)
+        for tool in build_tools(resolved):
             try:
                 await self._stack.enter_async_context(tool)
                 self.tools.append(tool)

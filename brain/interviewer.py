@@ -9,7 +9,6 @@ works, but a single-shot typed response is a much cleaner shape for gate logic
 available (`agent.run(msg, stream=True)`, per spikes/maf_python_spike.py) if a
 later phase wants token-by-token UX.
 """
-import json
 import logging
 import os
 
@@ -83,9 +82,13 @@ _agent = None  # lazy singleton; see _get_agent()
 
 class InterviewerError(Exception):
     """Raised when the model call fails or returns something we can't parse
-    into an InterviewTurn. Callers (app.py) catch this and degrade gracefully
-    -- abandon the queue message so it's redelivered, and tell the user we
-    hit a snag, rather than losing the turn or crashing the process."""
+    into an InterviewTurn. Callers (app.py's _run_interview_turn) catch this
+    and degrade gracefully: persist whatever state we have, reply once to tell
+    the user we hit a snag, then COMPLETE the queue message. It is deliberately
+    not re-raised -- abandoning would redeliver a deterministic failure up to
+    10x and spam the user with identical snack messages before dead-lettering.
+    Completing instead drops at most one turn on a transient blip; the reporter
+    just resends and the interview resumes from persisted state."""
 
 
 def _get_agent():
