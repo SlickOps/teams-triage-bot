@@ -35,9 +35,28 @@ _KV_SECRET_RE = re.compile(
 # AWS access key IDs.
 _AWS_KEY_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 
-# Generic long hex/base64url-ish blob (>=32 chars) -- catches most other secrets
-# (API keys, session ids) without touching ordinary words or short identifiers.
+# Candidate generic blob (>=32 chars): catches most other secrets (API keys,
+# session ids) that the specific patterns above miss. Kept broad here, then
+# filtered by _is_secret_shaped so we only redact genuinely high-entropy runs.
 _LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+
+# 40-char (or any-length) lowercase hex: git SHAs and similar hex digests.
+_HEX_RE = re.compile(r"[0-9a-f]+")
+
+
+def _is_secret_shaped(token: str) -> bool:
+    """Whether a >=32-char blob looks like a secret rather than a benign long
+    identifier. We redact only when the token mixes character classes beyond a
+    plain hex digest -- has an uppercase letter, a non-hex letter, or a _/-.
+    This deliberately PRESERVES useful forensic anchors as user-visible text:
+    40-char lowercase-hex git SHAs, all-alpha/all-digit id or URL path segments.
+    An API-key-shaped token trips at least one of those conditions and is still
+    redacted."""
+    if _HEX_RE.fullmatch(token):  # pure lowercase hex -> git SHA, digest
+        return False
+    if token.isalpha() or token.isdigit():  # uniform run -> path segment, id
+        return False
+    return True
 
 
 def redact(text: str) -> str:
@@ -48,5 +67,7 @@ def redact(text: str) -> str:
     out = _BEARER_RE.sub("[redacted]", out)
     out = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}=[redacted]", out)
     out = _AWS_KEY_RE.sub("[redacted]", out)
-    out = _LONG_TOKEN_RE.sub("[redacted]", out)
+    out = _LONG_TOKEN_RE.sub(
+        lambda m: "[redacted]" if _is_secret_shaped(m.group(0)) else m.group(0), out
+    )
     return out

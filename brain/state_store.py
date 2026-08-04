@@ -53,10 +53,30 @@ def _empty_intake() -> Intake:
 
 class InterviewState(BaseModel):
     user_id: str
-    status: str = "interviewing"  # "interviewing" | "complete"
+    status: str = "interviewing"  # "interviewing" | "complete" | "investigated"
     transcript: list[dict] = Field(default_factory=list)  # [{"role": "user"|"bot", "text": str}, ...]
     intake: Intake = Field(default_factory=_empty_intake)
     card_sent: bool = False
+    # Phase 3: the investigation report, once run_investigation() succeeds,
+    # stored as a JSON string (not the InvestigationReport model itself) for
+    # the same reason the rest of this file uses a flat "data" blob -- Table
+    # Storage entities are flat, and brain/investigation.py is the only place
+    # that needs the typed model back (state_store.py stays agnostic of its
+    # shape, matching how it already treats Intake/StructuredSummary loosely
+    # via the parent InterviewState blob rather than per-field columns).
+    investigation_report: str | None = None
+    # StructuredSummary JSON once the interview gate fires (status -> complete).
+    # Kept so investigation can be retried after a tool/model blip without
+    # forcing the reporter through intake again (app.py lifecycle).
+    structured_summary: str | None = None
+    # Durable activity idempotency (survives pod restart; the in-memory LRU
+    # in app.py does not). last_started is set when we first incorporate an
+    # activity into transcript/state; last_completed is set after a successful
+    # reply for that activity. Redelivery of a completed id is a no-op (or
+    # only re-queues pending investigation). Redelivery of a started-but-not-
+    # completed id resumes without double-appending the user turn.
+    last_started_activity_id: str | None = None
+    last_completed_activity_id: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
     expires_at: float = 0.0
@@ -92,9 +112,15 @@ class StateStore:
     async def get(self, user_id: str) -> InterviewState | None:
         client = await self._client()
         row_key = _sanitize_row_key(user_id)
+        # Only "not found" means absent. Auth/throttle/network failures must
+        # propagate so the queue message is abandoned and retried -- swallowing
+        # them as None used to silently start a brand-new InterviewState and
+        # wipe an in-progress interview.
+        from azure.core.exceptions import ResourceNotFoundError
+
         try:
             entity = await client.get_entity(partition_key=_PARTITION_KEY, row_key=row_key)
-        except Exception:
+        except ResourceNotFoundError:
             return None
         state = InterviewState.model_validate_json(entity["data"])
         if state.expires_at and state.expires_at < time.time():
@@ -144,7 +170,9 @@ class _InMemoryStateStore:
         if state.expires_at and state.expires_at < time.time():
             self._rows.pop(user_id, None)
             return None
-        return state
+        # Match Table semantics: callers get a detached copy so in-memory
+        # mutations before a successful put do not leak into the store.
+        return state.model_copy(deep=True)
 
     async def put(self, state: InterviewState) -> None:
         now = time.time()
@@ -152,7 +180,7 @@ class _InMemoryStateStore:
         if not state.created_at:
             state.created_at = now
         state.expires_at = now + TTL_SECONDS
-        self._rows[state.user_id] = state
+        self._rows[state.user_id] = state.model_copy(deep=True)
 
     async def delete(self, user_id: str) -> None:
         self._rows.pop(user_id, None)
